@@ -1,0 +1,263 @@
+#include <SoftwareSerial.h>
+#include <TinyGPS++.h>
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+
+#define GPS_DEBUG
+
+const char *ssid = "NodeMCU AP";
+const char *pass = "";
+
+SoftwareSerial gpsSerial(D2, D3); // Rx & Tx pins connected to NodeMCU
+TinyGPSPlus gps;
+
+#define HTTP_REST_PORT 8080
+ESP8266WebServer server(HTTP_REST_PORT);
+
+bool locState = false, dateState = false, timeState = false;
+
+double latitude, longitude, altitude, speed;
+uint16_t year;
+uint8_t month, day, hour, minute, second;
+uint8_t prevMinute = 0;
+
+const int histLimit = 60;
+
+int lastReadAddress2 = 0;
+
+double latHist[histLimit], longHist[histLimit];
+String dateHist[histLimit], timeHist[histLimit];
+
+String gpsString = "NA;;";
+
+// To add variables into stack array
+void push(double val, double arr[histLimit])
+{
+  static double result[histLimit];
+
+  result[0] = val;
+
+  for (int i = 0; i < histLimit - 1; i++)
+  {
+    result[i + 1] = arr[i];
+    yield();
+  }
+
+  for (int i = 0; i < histLimit; i++)
+  {
+    arr[i] = result[i];
+    yield();
+  }
+}
+
+void push(String val, String arr[histLimit])
+{
+  static String result[histLimit];
+
+  result[0] = val;
+
+  for (int i = 0; i < histLimit - 1; i++)
+  {
+    result[i + 1] = arr[i];
+    yield();
+  }
+
+  for (int i = 0; i < histLimit; i++)
+  {
+    arr[i] = result[i];
+    yield();
+  }
+}
+
+void handleNotFound()
+{
+  server.send(404, "text/plain", "404: Not Found");
+}
+
+void setup()
+{
+#ifdef GPS_DEBUG
+  Serial.begin(9600);
+#endif
+  gpsSerial.begin(9600);
+
+  WiFi.softAP(ssid, pass);  // Setting up Access Point
+
+  // Send gps string to server
+  server.on("/", HTTP_GET, []()
+            { server.send(200, "text/html", gpsString); });
+
+  server.onNotFound(handleNotFound);
+
+  // Initialize the history arrays
+  for (int i = 0; i < histLimit; i++)
+  {
+    latHist[i] = 0;
+    longHist[i] = 0;
+    dateHist[i] = "00000000";
+    timeHist[i] = "0000";
+  }
+}
+
+void getGpsData()
+{
+  // Check the data availability
+  locState = gps.location.isValid();
+  dateState = gps.date.isValid();
+  timeState = gps.time.isValid();
+
+  if (locState)
+  {
+    latitude = gps.location.lat();
+    longitude = gps.location.lng();
+    altitude = gps.altitude.meters();
+    speed = gps.speed.kmph();
+  }
+
+  if (dateState)
+  {
+    year = gps.date.year();
+    month = gps.date.month();
+    day = gps.date.day();
+  }
+  else
+  {
+    year = 0;
+    month = 0;
+    day = 0;
+  }
+
+  if (timeState)
+  {
+    hour = gps.time.hour() + 5;
+    minute = gps.time.minute() + 30;
+    second = gps.time.second();
+
+    if (minute >= 60)
+    {
+      minute -= 60;
+      ++hour;
+    }
+
+    if (hour >= 24)
+    {
+      hour -= 24;
+      ++day;
+    }
+
+    if (((month % 2) && (month <= 7)) || ((month % 2 == 0) && (month > 7)))
+      month += month >= 31;
+    else if (month == 2)
+      month += month >= 28;
+    else
+      month += month >= 30;
+
+    if (month > 12)
+    {
+      month -= 12;
+      ++year;
+    }
+  }
+  else
+  {
+    hour = 0;
+    minute = 0;
+    second = 0;
+  }
+}
+
+void constructGpsString()
+{
+  gpsString = "";
+
+  if (locState)
+  {
+    gpsString += String(latitude, 6) + ';';
+    gpsString += String(longitude, 6) + ';';
+    gpsString += String(altitude, 2) + ';';
+    gpsString += String(speed, 2) + ';';
+  }
+  else
+    gpsString += "NA;NA;NA;NA;";
+
+  if (dateState)
+  {
+    gpsString += year;
+    gpsString += month < 10 ? ('0' + String(month)) : String(month);
+    gpsString += (day < 10 ? ('0' + String(day)) : String(day)) + ';';
+  }
+  else
+    gpsString += "NA;";
+
+  if (timeState)
+  {
+    gpsString += hour < 10 ? ('0' + String(hour)) : String(hour);
+    gpsString += minute < 10 ? ('0' + String(minute)) : String(minute);
+    gpsString += (second < 10 ? ('0' + String(second)) : String(second)) + ";\n";
+  }
+  else
+    gpsString += "NA;";
+
+  for (int i = 0; i < 60; i++)
+  {
+    gpsString += String(latHist[i], 6) + ';' + String(longHist[i], 6) + ';';
+    gpsString += dateHist[i] + ';' + timeHist[i] + ';';
+  }
+}
+
+void loop()
+{
+  while (gpsSerial.available())
+  {
+    if (gps.encode(gpsSerial.read()))
+    {
+      getGpsData();
+
+      if (prevMinute != minute)
+      {
+        push(latitude, latHist);
+        push(longitude, longHist);
+        push(String(year) + (month < 10 ? ('0' + String(month)) : String(month)) + (day < 10 ? ('0' + String(day)) : String(day)), dateHist);
+        push((hour < 10 ? ('0' + String(hour)) : String(hour)) + (minute < 10 ? ('0' + String(minute)) : String(minute)) + (second < 10 ? ('0' + String(second)) : String(second)), timeHist);
+
+        prevMinute = minute;
+      }
+
+      constructGpsString();
+
+#ifdef GPS_DEBUG
+      Serial.println("GPS String: ");
+      Serial.println(gpsString);
+      Serial.println();
+
+      Serial.print("Position: ");
+      Serial.print(latitude);
+      Serial.print("; ");
+      Serial.println(longitude);
+
+      Serial.print("Altitude: ");
+      Serial.println(altitude);
+
+      Serial.print("Speed: ");
+      Serial.println(speed);
+
+      Serial.print("Date: ");
+      Serial.print(day);
+      Serial.print("/");
+      Serial.print(month);
+      Serial.print("/");
+      Serial.println(year);
+
+      Serial.print("Time: ");
+      Serial.print(hour);
+      Serial.print(":");
+      Serial.print(minute);
+      Serial.print(":");
+      Serial.println(second);
+      Serial.println();
+#endif
+
+      delay(1000);
+    }
+  }
+}
